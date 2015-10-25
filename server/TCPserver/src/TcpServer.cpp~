@@ -1,0 +1,207 @@
+/*
+ * TcpServer.cpp
+ *
+ *  Created on: Oct 11, 2015
+ *      Author: jeffery
+ */
+
+#include "h/TcpServer.h"
+
+void* runnable(void* agrs);
+int file_exist (const char *filename);
+static void writeScreenMessage(int msg_type,int cur_seq, int max_seq, int paylod_len);
+static int newsockfd[NUMBER_OF_THREADS];
+
+
+//Used to construct the Tcp server will create the socket when called
+TcpServer::TcpServer() {
+	//open tcp socket connection
+	sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	if(sockfd < 0){
+		cout << "ERROR: failed to create server socket\n";
+		exit(1);
+	}
+}
+
+TcpServer::~TcpServer() {
+
+}
+
+//Used to bind the socket that was created
+void TcpServer::bindAndListen(int portNumber, int backlog){
+	//Check and set port number
+	if(portNumber < 0){
+		cout << "ERROR: Invalid port number\n";
+		exit(1);
+	}
+	this->portnumber = portNumber;
+
+	//Bind socket to port number
+	serv_addr.sin_family = AF_INET;
+	serv_addr.sin_addr.s_addr = INADDR_ANY;
+	serv_addr.sin_port = htons(this->portnumber);
+	if( bind(sockfd, (struct sockaddr*) &serv_addr, sizeof(serv_addr)) ){
+		cout << "ERROR: Failed to bind socket to port\n";
+		exit(1);
+	}
+
+	//listen on socket
+	listen(sockfd, backlog);
+	char str[INET_ADDRSTRLEN];
+	inet_ntop(AF_INET, &(serv_addr.sin_addr), str, INET_ADDRSTRLEN);
+	cout << "listing on port " << ntohs(serv_addr.sin_port) << "\n ip address is " <<  ntohs(serv_addr.sin_addr.s_addr)  << "\n";
+}
+
+//Used to mulit thread the server when a new request is accepted it will create a new thread and detach it
+//The detach thread runs the code in runnable
+void TcpServer::acceptRequests(){
+	int threadCount = 0;
+	int thread_args[NUMBER_OF_THREADS];
+	while(1){
+		//accepting the request
+	     newsockfd[threadCount] = accept(sockfd, (struct sockaddr *) NULL, NULL);
+	     if (newsockfd < 0){
+	    	 perror("socket error");
+	    	 cout << "ERROR: problem on accept\n";
+	    	 cout << newsockfd << endl;
+	    	 cout << "thread count" << threadCount << endl;
+	    	 exit(1);
+	     }
+	     thread_args[threadCount] = threadCount;
+	     if( pthread_create(&threads[threadCount], NULL,runnable, &thread_args[threadCount])){
+	    	 cout << "ERROR: failed to make thread " << threadCount << endl;
+	     }
+	     pthread_detach(threads[threadCount]);
+	     threadCount++;
+	     if(threadCount > 10002){
+	    	 cout << "threadCount Reset\n";
+	    	 threadCount = 0;
+	     }
+	}
+}
+
+//
+void* runnable(void* args){
+	 int threadCount;
+	 threadCount = *((int *) args);
+
+    //Read client request
+	struct msg_t* message = new struct msg_t();
+	int sendSize = sizeof(int) + sizeof(int) + sizeof(int) + sizeof(int) + sizeof(char)*BUF_SZ;
+
+	//check for msg of type get
+    if( recv(newsockfd[threadCount], (void*) message, sendSize, 0) > 0){
+
+    	//Write out screen message when a request is received
+    	writeScreenMessage(message->msg_type,message->cur_seq,message->max_seq,message->payload_len);
+		#if ECHO == 1
+    		cout << "Payload: " << message->payload << endl;
+		#endif
+    }
+    else{
+    	perror("problem with server receiving: ");
+    }
+
+    //check to see if file exits in data folder
+    bool exist = 0;
+    string filename = (char*) message->payload;
+    filename = "TCPserver/src/data/" + filename;
+    exist = file_exist(filename.c_str());
+	#if ECHO == 1
+		cout << "Searching for : " << filename << endl;
+		cout << "File existence is " << exist << endl;
+	#endif
+
+	//if the pthread dosen't exist send message of type MSG_TYPE_GET_ERR
+	if(!exist){
+		struct msg_t* errMessage = new struct msg_t();
+		errMessage->msg_type = MSG_TYPE_GET_ERR;
+		errMessage->cur_seq = 1;
+		errMessage->max_seq = message->max_seq;
+		errMessage->payload_len = 0;
+		memset(errMessage->payload, 0, sizeof(errMessage->payload));
+	    if( send(newsockfd[threadCount] ,(char*) errMessage , sendSize , 0) < 0){
+	    	cout << "ERROR: failed to send error message\n";
+	    }
+	    //close socket and exit the tread
+	    if(close(newsockfd[threadCount])){
+	    	perror("socket error");
+	    	cout << "ERROR: socket Failed to close\n";
+	    	exit(1);
+	    }
+	    pthread_exit(0);
+	}
+
+	//Send back file packages
+	FilePackager* fpack = new FilePackager(filename,BUF_SZ);
+	int maxPackageNumber = fpack->numberOfPackages();
+	int pakageCount = 0;
+
+    if( send(newsockfd[threadCount] ,(char*) fpack->getMessage(pakageCount) , sendSize , 0) < 0){
+    	cout << "ERROR: failed to send error message\n";
+    }
+
+    pakageCount++;
+
+	//Wait for the first client ack
+    if( recv(newsockfd[threadCount], (void*) message, sendSize, 0) > 0){
+    	writeScreenMessage(message->msg_type,message->cur_seq,message->max_seq,message->payload_len);
+		#if ECHO == 1
+    		cout << "Payload: " << message->payload << endl;
+		#endif
+    }
+    else{
+    	perror("problem with server receiving: ");
+    }
+
+    //Continue to wait for client ack
+    while(message->msg_type == MSG_TYPE_GET_ACK && pakageCount < maxPackageNumber){
+        if( send(newsockfd[threadCount] ,(char*) fpack->getMessage(pakageCount) , sendSize , 0) < 0){
+        	cout << "ERROR: failed to send error message\n";
+        }
+        pakageCount++;
+        if( recv(newsockfd[threadCount], (void*) message, sendSize, 0) > 0){
+        	writeScreenMessage(message->msg_type,message->cur_seq,message->max_seq,message->payload_len);
+    		#if ECHO == 1
+        		cout << "Payload: " << message->payload << endl;
+    		#endif
+        }
+    }
+
+    if(close(newsockfd[threadCount])){
+    	perror("socket error");
+    	cout << "ERROR: socket Failed to close\n";
+    	exit(1);
+    }
+    pthread_exit(0);
+}
+
+int file_exist (const char* filename){
+	//debug the current working directory
+
+	char cwd[FILENAME_MAX];
+	if (getcwd(cwd, sizeof(cwd)) != NULL)
+		fprintf(stdout, "Current working dir: %s\n", cwd);
+	else
+		perror("getcwd() error");
+	string testName = "src/data/input_large.txt";
+	
+	struct stat   buffer;
+	return (stat (filename, &buffer) == 0);
+}
+
+//Used for printing Screen Message for each received message
+static void writeScreenMessage(int msg_type,int cur_seq, int max_seq, int paylod_len){
+	if(msg_type < 0 || msg_type > MSG_TYPE_MAX){
+		msg_type = MSG_TYPE_INVALID;
+	}
+    cout << "server: RX ";
+    cout << "<" << str_map[msg_type] << "> ";
+    cout << "<" << cur_seq << "> ";
+    cout << "<" << max_seq << "> ";
+    cout << "<" << paylod_len << "> ";
+    cout << endl;
+}
+
+
+

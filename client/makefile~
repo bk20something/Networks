@@ -1,0 +1,2 @@
+clean:
+    $(MAKE) -C client_tcp/Debug/make clean
